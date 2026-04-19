@@ -1,0 +1,387 @@
+---
+title: "Replication: Machine Learning-Based Fake News Detection"
+subtitle: "Implementation of Zeng & Tao (2024)"
+author: "Akul Srivatsa and Steven Ky"
+---
+
+```{r setup, include=FALSE}
+# Global options for the document
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(tm)           # Text mining
+library(SnowballC)    # Word stemming
+library(tidyverse)    # Data manipulation & ggplot2
+library(caret)        # ML workflow and CV
+library(e1071)        # Naive Bayes implementation
+library(randomForest) # Random Forest implementation
+library(nnet)         # Native R MLP implementation
+library(dplyr)        # Data transformation
+```
+
+```{r}
+# Load dataset
+df <- read.csv("buzzfeed_combined.csv", stringsAsFactors = FALSE)
+
+# Feature Engineering: Multimedia metadata
+# Converting link lists into binary indicators (0 = absent, 1 = present)
+df$has_images <- ifelse(is.na(df$images) | df$images == "" | df$images == "[]", 0, 1)
+df$has_movies <- ifelse(is.na(df$movies) | df$movies == "" | df$movies == "[]", 0, 1)
+```
+
+```{r}
+media_sources <- unique(df$source)
+
+# Create and clean the text corpus
+corpus <- VCorpus(VectorSource(df$text)) %>%
+  tm_map(content_transformer(tolower)) %>%
+  tm_map(removeNumbers) %>%
+  tm_map(removePunctuation) %>%
+  tm_map(removeWords, stopwords("english")) %>%
+  tm_map(removeWords, tolower(media_sources)) %>%
+  tm_map(stemDocument) %>%
+  tm_map(stripWhitespace)
+
+# Create Document-Term Matrix (DTM)
+dtm_mat <- as.matrix(DocumentTermMatrix(corpus))
+labels <- as.factor(make.names(df$label))
+```
+
+```{r}
+# Calculate p-values for word significance
+p_vals <- apply(dtm_mat, 2, function(x) {
+  if(length(unique(x > 0)) < 2) return(1)
+  chisq.test(table(x > 0, labels))$p.value
+})
+
+# Filter for significant terms (p < 0.05)
+sig_terms <- names(p_vals[p_vals < 0.05])
+final_data <- as.data.frame(dtm_mat[, sig_terms])
+
+# Integrate non-textual features and sanitize column names
+final_data$has_images <- df$has_images
+final_data$has_movies <- df$has_movies
+final_data$label <- labels
+names(final_data) <- make.names(names(final_data))
+
+# Remove Near-Zero Variance predictors
+nzv <- nearZeroVar(final_data)
+if(length(nzv) > 0) final_data <- final_data[, -nzv]
+```
+
+```{r}
+
+set.seed(123)
+nb_folds <- createFolds(final_data$label, k = 5)
+
+nb_results <- sapply(nb_folds, function(indices) {
+  model <- naiveBayes(label ~ ., data = final_data[-indices, ], laplace = 1)
+  preds <- predict(model, final_data[indices, ])
+  confusionMatrix(preds, final_data[indices, ]$label)$overall["Accuracy"]
+})
+
+cat("Naive Bayes Mean CV Accuracy:", mean(nb_results), "\n")
+```
+
+```{r}
+set.seed(123)
+lr_model <- train(label ~ ., data = final_data, method = "glmnet",
+                  trControl = trainControl(method = "cv", number = 5),
+                  family = "binomial")
+print(max(lr_model$results$Accuracy))
+```
+
+```{r}
+set.seed(123)
+# 500 trees used per parent paper methodology
+rf_model <- randomForest(label ~ ., data = final_data, ntree = 500)
+print(rf_model)
+```
+
+```{r}
+# Data Sanitization and Scaling
+mlp_input <- final_data %>%
+  dplyr::mutate(label = as.factor(label)) %>%
+  dplyr::filter(complete.cases(.))
+
+# Min-Max Normalization for neural network stability
+x_cols <- setdiff(names(mlp_input), "label")
+mlp_input[x_cols] <- lapply(mlp_input[x_cols], function(x) {
+  if(max(x) - min(x) == 0) return(x) 
+  (x - min(x)) / (max(x) - min(x))
+})
+
+# Training with nnet to avoid TensorFlow backend dependencies
+set.seed(123)
+mlp_fit <- caret::train(
+  label ~ ., 
+  data = mlp_input, 
+  method = "nnet", 
+  trControl = caret::trainControl(method = "cv", number = 5),
+  tuneGrid = expand.grid(size = c(10, 15), decay = c(0.1, 0.5)),
+  maxit = 500,
+  MaxNWts = 10000,
+  trace = FALSE
+)
+
+cat("MLP Replicated Accuracy:", round(max(mlp_fit$results$Accuracy), 4), "\n")
+```
+
+```{r}
+# TABLE I: Performance Comparison Table (Dynamic Version)
+# 1. Extract Accuracy from your specific model outputs
+# Naive Bayes: Mean of CV results
+nb_acc <- mean(nb_results)
+
+# Random Forest: (Correct Predictions / Total Predictions) from confusion matrix
+rf_acc <- sum(diag(rf_model$confusion[, 1:2])) / sum(rf_model$confusion[, 1:2])
+
+# Logistic Regression: Max accuracy from the glmnet tuning grid
+lr_acc <- max(lr_model$results$Accuracy)
+
+# MLP: Max accuracy from the nnet tuning grid
+mlp_acc <- max(mlp_fit$results$Accuracy, na.rm = TRUE)
+
+# 2. Build the Comparison Data Frame
+# Benchmarks are from Zeng & Tao (2024)
+performance_table <- data.frame(
+  Classifiers = c("Naive Bayes", "Random Forest", "Logistic Regression", "Multi Layer Perceptron"),
+  Replicated_Accuracy = round(c(nb_acc, rf_acc, lr_acc, mlp_acc), 4),
+  Parent_Paper_Benchmark = c(0.654, 0.836, 0.764, 0.909)
+)
+
+# 3. Format as a professional table
+knitr::kable(performance_table, 
+             caption = "TABLE I: PERFORMANCE COMPARISON OF VARIOUS CLASSIFIERS",
+             col.names = c("Classifiers", "Replicated Accuracy", "Zeng & Tao (2024) Benchmark"))
+```
+
+```{r}
+# Fig. 1: Statistical bar chart of real and fake news sources
+library(ggplot2)
+library(dplyr)
+
+# Prepare source count data
+source_counts <- df %>%
+  group_by(source, label) %>%
+  tally() %>%
+  mutate(label = ifelse(label == 0, "Real", "Fake"))
+
+# Plot for Fake News Sources (matches top half of Fig 1)
+ggplot(filter(source_counts, label == "Fake"), aes(x = reorder(source, n), y = n)) +
+  geom_bar(stat = "identity", fill = "#2980b9") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Source count of fake news in Buzzfeed", x = "source", y = "count")
+
+# Plot for Real News Sources (matches bottom half of Fig 1)
+ggplot(filter(source_counts, label == "Real"), aes(x = reorder(source, n), y = n)) +
+  geom_bar(stat = "identity", fill = "#c0392b") +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Source count of real news in Buzzfeed", x = "source", y = "count")
+
+# Fig. 2: Comparison chart of common sources
+# Filters for sources that appeared in both categories
+common_sources <- source_counts %>%
+  group_by(source) %>%
+  filter(n() > 1)
+
+ggplot(common_sources, aes(x = source, y = n, fill = label)) +
+  geom_bar(stat = "identity", position = "stack") +
+  coord_flip() +
+  scale_fill_manual(values = c("Fake" = "#2980b9", "Real" = "#c0392b")) +
+  theme_minimal() +
+  labs(title = "Common source of real and fake news in Buzzfeed", x = "Source", y = "Count")
+```
+
+```{r}
+# Function to get top words by label frequency
+get_top_words <- function(dtm, labels, top_n = 20) {
+  word_freqs <- as.data.frame(as.matrix(dtm))
+  word_freqs$label <- labels
+  
+  # Melt and aggregate
+  melted <- word_freqs %>%
+    pivot_longer(cols = -label, names_to = "word", values_to = "count") %>%
+    group_by(word, label) %>%
+    summarise(total = sum(count)) %>%
+    mutate(label = ifelse(label == "X0", "Real", "Fake"))
+  
+  # Identify top discriminatory words
+  top_words <- melted %>%
+    group_by(word) %>%
+    summarise(grand_total = sum(total)) %>%
+    arrange(desc(grand_total)) %>%
+    head(top_n) %>%
+    pull(word)
+    
+  return(filter(melted, word %in% top_words))
+}
+
+# Fig. 3: High Frequency Words in Titles (Top 20)
+# Note: Requires a separate DTM created from just titles
+title_data <- get_top_words(dtm_mat, labels, 20) # Replace dtm_mat with title DTM if available
+
+ggplot(title_data, aes(x = reorder(word, total), y = total, fill = label)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("Fake" = "#2980b9", "Real" = "#c0392b")) +
+  theme_minimal() +
+  labs(title = "Most discriminatory words in the title of news", x = "Top 20 words", y = "Term Frequency of words")
+
+# Fig. 4: High Frequency Words in Bodies (Top 30)
+body_data <- get_top_words(dtm_mat, labels, 30)
+
+ggplot(body_data, aes(x = reorder(word, total), y = total, fill = label)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("Fake" = "#2980b9", "Real" = "#c0392b")) +
+  theme_minimal() +
+  labs(title = "Most discriminatory words in the body of news article", x = "Top 30 words", y = "Term Frequency of words")
+```
+```{r}
+# 6. Novel Implementation: SHAP (SHapley Additive exPlanations)
+# Load necessary libraries for explainability
+library(fastshap)
+library(ggplot2)
+library(dplyr)
+
+# 1. Prepare the Prediction Wrapper
+# SHAP requires a custom function that returns a single numeric probability
+p_fun <- function(object, newdata) {
+  predict(object, newdata = newdata, type = "prob")[, "X1"]
+}
+
+# 2. Select an Instance to Explain
+# We'll explain the model's decision for the first article in the dataset
+set.seed(123)
+baseline <- mlp_input[sample(1:nrow(mlp_input), 10), x_cols] # Background distribution
+instance <- mlp_input[1, x_cols, drop = FALSE]              # The specific article
+
+# 3. Calculate SHAP Values
+# This calculates the "contribution" of each feature to the final probability
+shap_values <- fastshap::explain(
+  mlp_fit,
+  X = as.matrix(mlp_input[, x_cols]),
+  pred_wrapper = p_fun,
+  nsim = 50, # Number of Monte Carlo simulations
+  newdata = as.matrix(instance)
+)
+
+# 4. Prepare for Visualization
+shap_df <- data.frame(
+  Feature = names(instance),
+  ShapValue = as.numeric(shap_values)
+) %>%
+  arrange(desc(abs(ShapValue))) %>%
+  slice(1:15) # Show top 15 contributing words
+
+# 5. Visualizing the "Evidence"
+ggplot(shap_df, aes(x = reorder(Feature, ShapValue), y = ShapValue, fill = ShapValue > 0)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_manual(values = c("TRUE" = "#e74c3c", "FALSE" = "#2ecc71"), 
+                    labels = c("Pushes toward Real", "Pushes toward Fake")) +
+  theme_minimal() +
+  labs(
+    title = "SHAP Explanation: Why was this article flagged?",
+    subtitle = "Positive values (Red) increase the 'Fake News' probability score",
+    x = "Linguistic Feature",
+    y = "SHAP Value (Contribution)",
+    fill = "Impact"
+  )
+```
+
+```{r}
+# 7. Novel Implementation: Adversarial Stress Test
+# 1. Identify a 'Fake' article that the model classified correctly
+# We use the instance from our SHAP analysis
+original_probs <- predict(mlp_fit, newdata = instance, type = "prob")
+cat("Original Prediction (Fake News Probability):", round(original_probs$X1, 4), "\n")
+
+# 2. Create an 'Adversarial' Version
+# We manually 'perturb' the data by removing the top 3 red-flag features 
+# identified by SHAP: 'sound', 'buy', and 'wouldn.t'
+adversarial_instance <- instance
+adversarial_instance$sound <- 0
+adversarial_instance$buy <- 0
+adversarial_instance$wouldn.t <- 0
+
+# 3. Test the Model's Resilience
+adversarial_probs <- predict(mlp_fit, newdata = adversarial_instance, type = "prob")
+cat("Adversarial Prediction (After removing red flags):", round(adversarial_probs$X1, 4), "\n")
+
+# 4. Impact Analysis
+drop_in_confidence <- original_probs$X1 - adversarial_probs$X1
+cat("Drop in Model Confidence:", round(drop_in_confidence * 100, 2), "%\n")
+
+# 5. Visualization of Robustness
+robustness_df <- data.frame(
+  Scenario = c("Original Article", "Adversarial Article"),
+  Confidence = c(original_probs$X1, adversarial_probs$X1)
+)
+
+ggplot(robustness_df, aes(x = Scenario, y = Confidence, fill = Scenario)) +
+  geom_bar(stat = "identity", width = 0.5) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Model Robustness: Adversarial Sensitivity Test",
+       subtitle = "Does removing 'Red Flag' words change the classification?",
+       y = "Probability of being 'Fake'") +
+  scale_fill_manual(values = c("Original Article" = "#e74c3c", "Adversarial Article" = "#f39c12"))
+```
+
+```{r}
+# 8. Novel Implementation: Synonym Substitution Test (with Logging)
+# 1. Identify the 'Fake' article instance and its original probability
+original_prob <- predict(mlp_fit, newdata = instance, type = "prob")$X1
+cat("--- ADVERSARIAL AUDIT START ---\n")
+cat("Original Prediction (Fake News Probability):", round(original_prob, 4), "\n\n")
+
+# 2. Create the 'Synonym-Swapped' Instance
+synonym_instance <- instance
+
+# Function to safely swap values and print status
+safe_swap <- function(data_inst, target_word, synonym_word) {
+  if (target_word %in% names(data_inst) && data_inst[[target_word]] > 0) {
+    if (synonym_word %in% names(data_inst)) {
+      # Perform the swap: Transfer weight to synonym
+      data_inst[[synonym_word]] <- data_inst[[synonym_word]] + data_inst[[target_word]]
+      data_inst[[target_word]] <- 0
+      cat(paste0("SUCCESS: '", target_word, "' swapped for '", synonym_word, "'\n"))
+    } else {
+      # Fallback: Word is removed because synonym wasn't a significant feature
+      data_inst[[target_word]] <- 0
+      cat(paste0("NOTICE: '", target_word, "' removed (Synonym '", synonym_word, "' not in feature set)\n"))
+    }
+  }
+  return(data_inst)
+}
+
+# 3. Execute Swaps based on SHAP Red Flags
+synonym_instance <- safe_swap(synonym_instance, "sound", "audio")
+synonym_instance <- safe_swap(synonym_instance, "buy", "purchas")
+synonym_instance <- safe_swap(synonym_instance, "wouldn.t", "not")
+
+# 4. Test the Model's Semantic Robustness
+synonym_prob <- predict(mlp_fit, newdata = synonym_instance, type = "prob")$X1
+cat("\nAdversarial Prediction (After Swaps):", round(synonym_prob, 4), "\n")
+cat("--- ADVERSARIAL AUDIT END ---\n")
+
+# 5. Result Visualization
+comparison_df <- data.frame(
+  Method = c("Original Article", "Synonym Swapped"),
+  Confidence = c(original_prob, synonym_prob)
+)
+
+ggplot(comparison_df, aes(x = Method, y = Confidence, fill = Method)) +
+  geom_bar(stat = "identity", width = 0.4) +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Semantic Robustness: Synonym Substitution Test",
+       subtitle = "Checking if the model tracks 'Meaning' or just 'Specific Words'",
+       y = "Probability of 'Fake'") +
+  scale_fill_manual(values = c("Original Article" = "#e74c3c", "Synonym Swapped" = "#3498db"))
+```
